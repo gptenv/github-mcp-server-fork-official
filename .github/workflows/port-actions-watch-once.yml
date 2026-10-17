@@ -1,0 +1,201 @@
+name: Port upstream Actions watch feature once
+on:
+  push:
+    branches: [feat/actions-watch-workflow-run-resolved]
+    paths: [.github/workflows/port-actions-watch-once.yml]
+permissions:
+  contents: write
+jobs:
+  port-and-validate:
+    if: github.repository == 'gptenv/github-mcp-server-fork-official'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Adapt the exact upstream commit to current typed Actions contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          sha = "1c7d37aac4bc9697bdbe853a844e6c502d07c30c"
+          base = "e3809fe91c7546633241006bf0b91f23b2595e28"
+          assert subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip() == base
+          subprocess.run(["git", "fetch", "--no-tags", "https://github.com/github/github-mcp-server.git", sha], check=True)
+          def source(path):
+              return subprocess.check_output(["git", "show", f"{sha}:{path}"], text=True)
+          def replace(text, old, new):
+              assert text.count(old) == 1, (old, text.count(old))
+              return text.replace(old, new, 1)
+          def edit(path, transform):
+              p = Path(path)
+              p.write_text(transform(p.read_text()))
+
+          actions = source("pkg/github/actions.go")
+          config = actions[actions.index("const (\n\tdefaultWatchTimeoutSeconds"):actions.index("// handleFailedJobLogs")]
+          helpers = actions[actions.index("// watchWorkflowRun polls"):actions.index("func getWorkflowJob(")]
+          helpers = helpers.replace("(*mcp.CallToolResult, any, error)", "(*mcp.CallToolResult, *ActionsGetOutput, error)")
+          helpers = replace(helpers, 'return utils.NewToolResultText(string(r)), nil, nil', 'return utils.NewToolResultText(string(r)), &ActionsGetOutput{Method: actionsMethodWatchWorkflowRun, Watch: &result}, nil')
+          header = """package github
+
+          import (
+              "context"
+              "encoding/json"
+              "fmt"
+              "time"
+
+              ghErrors "github.com/github/github-mcp-server/v2/pkg/errors"
+              "github.com/github/github-mcp-server/v2/pkg/utils"
+              "github.com/google/go-github/v92/github"
+              "github.com/modelcontextprotocol/go-sdk/mcp"
+          )
+
+          const actionsMethodWatchWorkflowRun = "watch_workflow_run"
+
+          """
+          Path("pkg/github/actions_watch.go").write_text(header + config + helpers)
+          minimal = source("pkg/github/minimal_types.go")
+          new_types = minimal[minimal.index("// MinimalFailedWorkflowJob"):minimal.index("// MinimalWorkflowJobStep")]
+          edit("pkg/github/minimal_types.go", lambda s: replace(s, "// MinimalWorkflowJobStep", new_types + "// MinimalWorkflowJobStep"))
+
+          schema_property = """                    "timeout_seconds": {
+                                  Type: "number",
+                                  Description: "How long to wait for the workflow run to complete before returning its current status. **ONLY** used when method is 'watch_workflow_run'. Default 45, maximum 600.",
+                                  Minimum: new(1.0),
+                                  Maximum: new(600.0),
+                              },
+          """
+          def update_actions(s):
+              s = replace(s, '\t"strings"\n', '\t"strings"\n\t"time"\n')
+              start, end = s.index("func ActionsGet("), s.index("// ActionsRunTrigger returns")
+              section = s[start:end]
+              section = replace(section, "Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs.\n", "Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs.\nUse the 'watch_workflow_run' method to wait for a workflow run to finish instead of polling 'get_workflow_run' repeatedly.\n")
+              section = replace(section, "'get_workflow_run_usage', and 'get_workflow_run_logs_url' methods.", "'get_workflow_run_usage', 'get_workflow_run_logs_url', and 'watch_workflow_run' methods.")
+              section = replace(section, '\t\t\t\t},\n\t\t\t\tRequired:', schema_property + '\t\t\t\t},\n\t\t\t\tRequired:')
+              section = replace(section, '_ *mcp.CallToolRequest, args ActionsGetInput', 'request *mcp.CallToolRequest, args ActionsGetInput')
+              case = """            case actionsMethodWatchWorkflowRun:
+                          result, payload, err := watchWorkflowRun(ctx, client, request, owner, repo, resourceIDInt, time.Duration(args.TimeoutSeconds)*time.Second)
+                          return attachIFC(result), payload, err
+          """
+              section = replace(section, '\t\t\tcase actionsMethodGetWorkflowRunLogsURL:', case + '\t\t\tcase actionsMethodGetWorkflowRunLogsURL:')
+              return s[:start] + section + s[end:]
+          edit("pkg/github/actions.go", update_actions)
+
+          def update_types(s):
+              s = replace(s, 'actionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL,\n', 'actionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL, actionsMethodWatchWorkflowRun,\n')
+              start, end = s.index('type ActionsGetInput struct {'), s.index('type ActionsRunTriggerInput struct {')
+              section = s[start:end]
+              section = replace(section, '\n}\n', '\n\tTimeoutSeconds int `json:"timeout_seconds,omitempty"`\n}\n')
+              s = s[:start] + section + s[end:]
+              start, end = s.index('type ActionsGetOutput struct {'), s.index('type ActionsRunUsageOutput struct {')
+              section = replace(s[start:end], '\n}\n', '\n\tWatch *MinimalWorkflowRunWatchResult `json:"watch,omitempty"`\n}\n')
+              s = s[:start] + section + s[end:]
+              s = replace(s, 'actionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs",', 'actionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs",\n\t\tactionsMethodWatchWorkflowRun: "watch",')
+              old = '\tcase "get":\n\t\t_, err := RequiredParam[string](args, "resource_id")\n\t\treturn err'
+              new = """    case "get":
+                  if _, err := RequiredParam[string](args, "resource_id"); err != nil {
+                      return err
+                  }
+                  if args["method"] != actionsMethodWatchWorkflowRun {
+                      delete(args, "timeout_seconds")
+                      return nil
+                  }
+                  timeout, err := OptionalIntParamWithDefault(args, "timeout_seconds", defaultWatchTimeoutSeconds)
+                  if err != nil {
+                      return err
+                  }
+                  if timeout < 1 || timeout > maxWatchTimeoutSeconds {
+                      return fmt.Errorf("timeout_seconds must be between 1 and %d", maxWatchTimeoutSeconds)
+                  }
+                  args["timeout_seconds"] = timeout
+                  return nil"""
+              s = replace(s, old, new)
+              return replace(s, '\t"encoding/json"\n', '\t"encoding/json"\n\t"fmt"\n')
+          edit("pkg/github/actions_types.go", update_types)
+
+          tests = source("pkg/github/actions_test.go")
+          tests = tests[tests.index("// workflowRunSequence serves"):tests.index("func Test_ActionsRunTrigger(")]
+          test_header = """package github
+
+          import (
+              "context"
+              "encoding/json"
+              "maps"
+              "net/http"
+              "sync"
+              "sync/atomic"
+              "testing"
+              "time"
+
+              "github.com/github/github-mcp-server/v2/pkg/translations"
+              "github.com/google/go-github/v92/github"
+              "github.com/modelcontextprotocol/go-sdk/mcp"
+              "github.com/stretchr/testify/assert"
+              "github.com/stretchr/testify/require"
+          )
+
+          """
+          wire_test = """
+          func TestTypedActionsWatchWorkflowRun(t *testing.T) {
+              for _, protocol := range typedActionsProtocols {
+                  t.Run("protocol="+protocol, func(t *testing.T) {
+                      run := actionsTestWorkflowRun()
+                      run.Status, run.Conclusion = new("completed"), new("success")
+                      deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+                          GetReposActionsRunsByOwnerByRepoByRunID: mockResponse(t, http.StatusOK, run),
+                      }))}
+                      session, schemas := actionsTypedSession(t, deps, protocol)
+                      result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+                          Name: "actions_get",
+                          Arguments: map[string]any{"method": "watch_workflow_run", "owner": "owner", "repo": "repo", "resource_id": "30433642", "timeout_seconds": "45"},
+                      })
+                      require.NoError(t, err)
+                      require.False(t, result.IsError, getTextResult(t, result).Text)
+                      expected := MinimalWorkflowRunWatchResult{WorkflowRun: convertToMinimalWorkflowRun(run), Completed: true}
+                      if schema := schemas["actions_get"]; schema != nil {
+                          var value any
+                          require.NoError(t, json.Unmarshal([]byte(mustMarshalJSON(t, result.StructuredContent)), &value))
+                          require.NoError(t, schema.Validate(value))
+                          var output ActionsGetOutput
+                          require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &output))
+                          require.Equal(t, ActionsGetMethod(actionsMethodWatchWorkflowRun), output.Method)
+                          require.NotNil(t, output.Watch)
+                          assert.Equal(t, expected, *output.Watch)
+                      } else {
+                          var output MinimalWorkflowRunWatchResult
+                          require.NoError(t, json.Unmarshal([]byte(getTextResult(t, result).Text), &output))
+                          assert.Equal(t, expected, output)
+                      }
+                  })
+              }
+          }
+          """
+          Path("pkg/github/actions_watch_test.go").write_text(test_header + tests + wire_test)
+          PY
+          gofmt -w pkg/github/actions.go pkg/github/actions_types.go pkg/github/actions_watch.go pkg/github/actions_watch_test.go pkg/github/minimal_types.go
+      - name: Regenerate schemas and documentation
+        run: |
+          set -euo pipefail
+          UPDATE_TOOLSNAPS=true go test ./pkg/github
+          bash script/generate-docs
+      - name: Validate the complete test suite with the race detector
+        run: go test -race ./...
+      - name: Commit only the validated port to the same branch
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md pkg/github/actions.go pkg/github/actions_types.go pkg/github/actions_watch.go pkg/github/actions_watch_test.go pkg/github/minimal_types.go pkg/github/__toolsnaps__/actions_get.snap
+          test -z "$(git diff --name-only)"
+          test -z "$(git ls-files --others --exclude-standard)"
+          git commit -m 'feat(actions): port watch_workflow_run onto typed v2 APIs' -m 'Adapt github/github-mcp-server#3406 at 1c7d37aac4bc9697bdbe853a844e6c502d07c30c. Preserve current typed inputs, method-discriminated outputs, IFC labeling, and v2 imports. Regenerate schema/docs and validate with go test -race ./....' -m 'Co-authored-by: Mehdi <mehdimamasxd@gmail.com>'
+          git push origin HEAD:refs/heads/feat/actions-watch-workflow-run-resolved

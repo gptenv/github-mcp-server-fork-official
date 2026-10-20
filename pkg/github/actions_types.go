@@ -28,7 +28,7 @@ var actionsEnumSchemas = sync.OnceValue(func() map[reflect.Type]*jsonschema.Sche
 		}},
 		reflect.TypeFor[ActionsGetMethod](): {Type: "string", Enum: []any{
 			actionsMethodGetWorkflow, actionsMethodGetWorkflowRun, actionsMethodGetWorkflowJob,
-			actionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL,
+			actionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL, actionsMethodWatchWorkflowRun,
 		}},
 		reflect.TypeFor[ActionsRunTriggerMethod](): {Type: "string", Enum: []any{
 			actionsMethodRunWorkflow, actionsMethodRerunWorkflowRun, actionsMethodRerunFailedJobs,
@@ -142,7 +142,7 @@ func actionsValidationSchema(inputSchema any) *jsonschema.Schema {
 			},
 		}
 	}
-	for _, field := range []string{"page", "perPage"} {
+	for _, field := range []string{"page", "perPage", "timeout_seconds"} {
 		if property := schema.Properties[field]; property != nil {
 			property.Minimum, property.Maximum = nil, nil
 		}
@@ -151,10 +151,11 @@ func actionsValidationSchema(inputSchema any) *jsonschema.Schema {
 }
 
 type ActionsGetInput struct {
-	Method     string `json:"method"`
-	Owner      string `json:"owner"`
-	Repo       string `json:"repo"`
-	ResourceID string `json:"resource_id"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	Method         string `json:"method"`
+	Owner          string `json:"owner"`
+	Repo           string `json:"repo"`
+	ResourceID     string `json:"resource_id"`
 }
 
 type ActionsRunTriggerInput struct {
@@ -239,6 +240,7 @@ var actionsListOutputSchema = sync.OnceValue(func() *jsonschema.Schema {
 })
 
 type ActionsGetOutput struct {
+	Watch    *MinimalWorkflowRunWatchResult `json:"watch,omitempty"`
 	Method   ActionsGetMethod               `json:"method,omitempty"`
 	Workflow *ActionsWorkflow               `json:"workflow,omitempty"`
 	Run      *MinimalWorkflowRun            `json:"workflow_run,omitempty"`
@@ -366,7 +368,7 @@ var actionsGetOutputSchema = sync.OnceValue(func() *jsonschema.Schema {
 	constrainMethodOutput(schema, map[string]string{
 		actionsMethodGetWorkflow: "workflow", actionsMethodGetWorkflowRun: "workflow_run",
 		actionsMethodGetWorkflowJob: "workflow_job", actionsMethodGetWorkflowRunUsage: "usage",
-		actionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs",
+		actionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs", actionsMethodWatchWorkflowRun: "watch",
 	}, "workflow", "workflow_job", "usage")
 	return schema
 })
@@ -589,8 +591,19 @@ func normalizeActionsFields(args map[string]any, kind string) error {
 	}
 	switch kind {
 	case "get":
-		_, err := RequiredParam[string](args, "resource_id")
-		return err
+		if _, err := RequiredParam[string](args, "resource_id"); err != nil {
+			return err
+		}
+		if args["method"] != actionsMethodWatchWorkflowRun {
+			delete(args, "timeout_seconds")
+			return nil
+		}
+		timeout, err := OptionalIntParamWithDefault(args, "timeout_seconds", defaultWatchTimeoutSeconds)
+		if err != nil {
+			return err
+		}
+		args["timeout_seconds"] = timeout
+		return nil
 	case "list":
 		if _, err := OptionalParam[string](args, "resource_id"); err != nil {
 			return err

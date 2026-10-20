@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/github/github-mcp-server/v2/internal/profiler"
 	buffer "github.com/github/github-mcp-server/v2/pkg/buffer"
@@ -383,6 +384,7 @@ func ActionsGet(t translations.TranslationHelperFunc) inventory.ServerTool {
 			OutputSchema: actionsGetOutputSchema(),
 			Description: t("TOOL_ACTIONS_GET_DESCRIPTION", `Get details about specific GitHub Actions resources.
 Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs.
+Use the 'watch_workflow_run' method to wait for a workflow run to finish instead of polling 'get_workflow_run' repeatedly.
 `),
 			Annotations: &mcp.ToolAnnotations{
 				Title:        t("TOOL_ACTIONS_GET_USER_TITLE", "Get details of GitHub Actions resources (workflows, workflow runs, jobs, and artifacts)"),
@@ -408,17 +410,23 @@ Use this tool to get details about individual workflows, workflow runs, jobs, an
 						Type: "string",
 						Description: `The unique identifier of the resource. This will vary based on the "method" provided, so ensure you provide the correct ID:
 - Provide a workflow ID or workflow file name (e.g. ci.yaml) for 'get_workflow' method.
-- Provide a workflow run ID for 'get_workflow_run', 'get_workflow_run_usage', and 'get_workflow_run_logs_url' methods.
+- Provide a workflow run ID for 'get_workflow_run', 'get_workflow_run_usage', 'get_workflow_run_logs_url', and 'watch_workflow_run' methods.
 - Provide an artifact ID for 'download_workflow_run_artifact' method.
 - Provide a job ID for 'get_workflow_job' method.
 `,
+					},
+					"timeout_seconds": {
+						Type:        "number",
+						Description: fmt.Sprintf("How long to wait for the workflow run to complete before returning its current status. **ONLY** used when method is 'watch_workflow_run'. Default %d, maximum %d.", defaultWatchTimeoutSeconds, maxWatchTimeoutSeconds),
+						Minimum:     new(1.0),
+						Maximum:     new(float64(maxWatchTimeoutSeconds)),
 					},
 				},
 				Required: []string{"method", "owner", "repo", "resource_id"},
 			},
 		},
 		scopes.PublicRead(scopes.Repo),
-		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args ActionsGetInput) (*mcp.CallToolResult, *ActionsGetOutput, error) {
+		func(ctx context.Context, deps ToolDependencies, request *mcp.CallToolRequest, args ActionsGetInput) (*mcp.CallToolResult, *ActionsGetOutput, error) {
 			owner, repo, method, resourceID := args.Owner, args.Repo, args.Method, args.ResourceID
 
 			client, err := deps.GetClient(ctx)
@@ -465,6 +473,16 @@ Use this tool to get details about individual workflows, workflow runs, jobs, an
 				return attachIFC(result), payload, err
 			case actionsMethodGetWorkflowRunLogsURL:
 				result, payload, err := getWorkflowRunLogsURL(ctx, client, owner, repo, resourceIDInt)
+				return attachIFC(result), payload, err
+			case actionsMethodWatchWorkflowRun:
+				timeoutSeconds := args.TimeoutSeconds
+				if timeoutSeconds == 0 {
+					timeoutSeconds = defaultWatchTimeoutSeconds
+				}
+				if timeoutSeconds < 1 || timeoutSeconds > maxWatchTimeoutSeconds {
+					return utils.NewToolResultError(fmt.Sprintf("timeout_seconds must be between 1 and %d", maxWatchTimeoutSeconds)), nil, nil
+				}
+				result, payload, err := watchWorkflowRun(ctx, client, request, owner, repo, resourceIDInt, time.Duration(timeoutSeconds)*time.Second)
 				return attachIFC(result), payload, err
 			default:
 				return utils.NewToolResultError(fmt.Sprintf("unknown method: %s", method)), nil, nil

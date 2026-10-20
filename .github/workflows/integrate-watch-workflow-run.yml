@@ -1,0 +1,232 @@
+name: Prepare and validate workflow-run watch port
+"on":
+  push:
+    branches: [integration/watch-workflow-run-1c7d37a]
+    paths: [.github/workflows/integrate-watch-workflow-run.yml]
+permissions:
+  contents: write
+concurrency:
+  group: integrate-watch-workflow-run-1c7d37a
+  cancel-in-progress: false
+jobs:
+  port-and-test:
+    if: github.repository == 'gptenv/github-mcp-server-fork-official'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Verify pinned base and fetch pinned upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = e3809fe91c7546633241006bf0b91f23b2595e28
+          git fetch --no-tags https://github.com/github/github-mcp-server.git 1c7d37aac4bc9697bdbe853a844e6c502d07c30c
+          test "$(git rev-parse FETCH_HEAD)" = 1c7d37aac4bc9697bdbe853a844e6c502d07c30c
+      - name: Build UI
+        uses: ./.github/actions/build-ui
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Port pinned feature without reverting typed Actions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          SOURCE = "1c7d37aac4bc9697bdbe853a844e6c502d07c30c"
+
+          def upstream(path):
+              return subprocess.check_output(["git", "show", f"{SOURCE}:{path}"], text=True)
+
+          def between(text, start, end):
+              assert text.count(start) == 1, start
+              return start + text.split(start, 1)[1].split(end, 1)[0]
+
+          def replace_once(text, old, new):
+              assert text.count(old) == 1, (old, text.count(old))
+              return text.replace(old, new, 1)
+
+          original = upstream("pkg/github/actions.go")
+          config = between(original, "const (\n\tdefaultWatchTimeoutSeconds", "// handleFailedJobLogs")
+          helpers = between(original, "// watchWorkflowRun polls", "func getWorkflowJob(")
+          assert helpers.count("(*mcp.CallToolResult, any, error)") == 2
+          helpers = helpers.replace("(*mcp.CallToolResult, any, error)", "(*mcp.CallToolResult, *ActionsGetOutput, error)")
+          helpers = replace_once(helpers, "return utils.NewToolResultText(string(r)), nil, nil", "return utils.NewToolResultText(string(r)), &ActionsGetOutput{Method: actionsMethodWatchWorkflowRun, Watch: &result}, nil")
+          types = between(upstream("pkg/github/minimal_types.go"), "// MinimalFailedWorkflowJob", "// MinimalWorkflowJobStep")
+          header = """package github
+
+          import (
+              "context"
+              "encoding/json"
+              "fmt"
+              "time"
+
+              ghErrors "github.com/github/github-mcp-server/v2/pkg/errors"
+              "github.com/github/github-mcp-server/v2/pkg/utils"
+              "github.com/google/go-github/v92/github"
+              "github.com/modelcontextprotocol/go-sdk/mcp"
+          )
+
+          const actionsMethodWatchWorkflowRun = "watch_workflow_run"
+
+          """
+          Path("pkg/github/actions_watch.go").write_text(header + config + types + helpers)
+
+          path = Path("pkg/github/actions.go")
+          text = path.read_text()
+          text = replace_once(text, '\t"strings"\n', '\t"strings"\n\t"time"\n')
+          start = text.index("func ActionsGet(")
+          end = text.index("// ActionsRunTrigger returns", start)
+          block = text[start:end]
+          block = replace_once(block, "Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs.\n", "Use this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs.\nUse the 'watch_workflow_run' method to wait for a workflow run to finish instead of polling 'get_workflow_run' repeatedly.\n")
+          block = replace_once(block, "'get_workflow_run_usage', and 'get_workflow_run_logs_url' methods.", "'get_workflow_run_usage', 'get_workflow_run_logs_url', and 'watch_workflow_run' methods.")
+          property_text = """                    "timeout_seconds": {
+                                  Type: "number",
+                                  Description: fmt.Sprintf("How long to wait for the workflow run to complete before returning its current status. **ONLY** used when method is 'watch_workflow_run'. Default %d, maximum %d.", defaultWatchTimeoutSeconds, maxWatchTimeoutSeconds),
+                                  Minimum: new(1.0),
+                                  Maximum: new(float64(maxWatchTimeoutSeconds)),
+                              },
+          """
+          block = replace_once(block, '\t\t\t\t},\n\t\t\t\tRequired:', property_text + '\t\t\t\t},\n\t\t\t\tRequired:')
+          block = replace_once(block, '_ *mcp.CallToolRequest, args ActionsGetInput', 'request *mcp.CallToolRequest, args ActionsGetInput')
+          watch_case = """            case actionsMethodWatchWorkflowRun:
+                          timeoutSeconds := args.TimeoutSeconds
+                          if timeoutSeconds == 0 {
+                              timeoutSeconds = defaultWatchTimeoutSeconds
+                          }
+                          if timeoutSeconds < 1 || timeoutSeconds > maxWatchTimeoutSeconds {
+                              return utils.NewToolResultError(fmt.Sprintf("timeout_seconds must be between 1 and %d", maxWatchTimeoutSeconds)), nil, nil
+                          }
+                          result, payload, err := watchWorkflowRun(ctx, client, request, owner, repo, resourceIDInt, time.Duration(timeoutSeconds)*time.Second)
+                          return attachIFC(result), payload, err
+          """
+          block = replace_once(block, '\t\t\tdefault:\n\t\t\t\treturn utils.NewToolResultError(fmt.Sprintf("unknown method: %s", method)), nil, nil', watch_case + '\t\t\tdefault:\n\t\t\t\treturn utils.NewToolResultError(fmt.Sprintf("unknown method: %s", method)), nil, nil')
+          path.write_text(text[:start] + block + text[end:])
+
+          path = Path("pkg/github/actions_types.go")
+          text = path.read_text()
+          text = replace_once(text, '\t\t\tactionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL,\n', '\t\t\tactionsMethodDownloadWorkflowArtifact, actionsMethodGetWorkflowRunUsage, actionsMethodGetWorkflowRunLogsURL, actionsMethodWatchWorkflowRun,\n')
+          text = replace_once(text, 'type ActionsGetInput struct {\n', 'type ActionsGetInput struct {\n\tTimeoutSeconds int `json:"timeout_seconds,omitempty"`\n')
+          text = replace_once(text, 'type ActionsGetOutput struct {\n', 'type ActionsGetOutput struct {\n\tWatch *MinimalWorkflowRunWatchResult `json:"watch,omitempty"`\n')
+          text = replace_once(text, '\t\tactionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs",\n', '\t\tactionsMethodDownloadWorkflowArtifact: "artifact", actionsMethodGetWorkflowRunLogsURL: "logs", actionsMethodWatchWorkflowRun: "watch",\n')
+          text = replace_once(text, '[]string{"page", "perPage"}', '[]string{"page", "perPage", "timeout_seconds"}')
+          text = replace_once(text, '\tcase "get":\n\t\t_, err := RequiredParam[string](args, "resource_id")\n\t\treturn err', """    case "get":
+                  if _, err := RequiredParam[string](args, "resource_id"); err != nil {
+                      return err
+                  }
+                  if args["method"] != actionsMethodWatchWorkflowRun {
+                      delete(args, "timeout_seconds")
+                      return nil
+                  }
+                  timeout, err := OptionalIntParamWithDefault(args, "timeout_seconds", defaultWatchTimeoutSeconds)
+                  if err != nil {
+                      return err
+                  }
+                  args["timeout_seconds"] = timeout
+                  return nil""")
+          path.write_text(text)
+
+          tests = between(upstream("pkg/github/actions_test.go"), "// workflowRunSequence serves", "func Test_ActionsRunTrigger(")
+          test_header = """package github
+
+          import (
+              "context"
+              "encoding/json"
+              "maps"
+              "net/http"
+              "sync"
+              "sync/atomic"
+              "testing"
+              "time"
+
+              "github.com/github/github-mcp-server/v2/pkg/translations"
+              "github.com/google/go-github/v92/github"
+              "github.com/modelcontextprotocol/go-sdk/mcp"
+              "github.com/stretchr/testify/assert"
+              "github.com/stretchr/testify/require"
+          )
+
+          """
+          wire_tests = """
+          func TestTypedActionsWatchWorkflowRunWire(t *testing.T) {
+              for _, protocol := range typedActionsProtocols {
+                  for _, state := range [][2]string{{"completed", "success"}, {"completed", "failure"}, {"in_progress", ""}} {
+                      t.Run(protocol+"/"+state[0]+"/"+state[1], func(t *testing.T) {
+                          runHandler, _ := workflowRunSequence(state)
+                          deps := BaseDeps{Client: mustNewGHClient(t, MockHTTPClientWithHandlers(map[string]http.HandlerFunc{
+                              GetReposActionsRunsByOwnerByRepoByRunID: runHandler,
+                              GetReposActionsRunsJobsByOwnerByRepoByRunID: mockResponse(t, http.StatusOK, &github.Jobs{
+                                  TotalCount: new(1),
+                                  Jobs: []*github.WorkflowJob{{ID: new(int64(2)), Name: new("test"), Status: new("completed"), Conclusion: new("failure")}},
+                              }),
+                          }))}
+                          session, schemas := actionsTypedSession(t, deps, protocol)
+                          result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+                              Name: "actions_get",
+                              Arguments: map[string]any{"method": "watch_workflow_run", "owner": "owner", "repo": "repo", "resource_id": "30433642", "timeout_seconds": "1"},
+                          })
+                          require.NoError(t, err)
+                          expected := MinimalWorkflowRunWatchResult{WorkflowRun: watchedRun(state[0], state[1]), Completed: state[0] == "completed"}
+                          if !expected.Completed {
+                              expected.WaitedSeconds = 1
+                              expected.NextStep = "The workflow run is still in_progress. Call watch_workflow_run again to keep waiting."
+                          } else if state[1] == "failure" {
+                              expected.FailedJobs = []MinimalFailedWorkflowJob{{ID: 2, Name: "test", Conclusion: "failure"}}
+                              expected.NextStep = "Use get_job_logs with run_id 30433642 and failed_only true to read the logs of the failed jobs."
+                          }
+                          projected := mustMarshalJSON(t, map[string]any{"method": "watch_workflow_run", "watch": expected})
+                          assertActionsWireResult(t, result, schemas["actions_get"], mustMarshalJSON(t, expected), false, projected)
+                      })
+                  }
+              }
+          }
+          """
+          Path("pkg/github/actions_watch_test.go").write_text(test_header + tests + wire_tests)
+
+          path = Path("pkg/github/typed_actions_outputs_test.go")
+          text = path.read_text()
+          text = replace_once(text, '\"get_workflow_run_usage\", \"get_workflow_run_logs_url\"}, get.Properties[\"method\"].Enum)', '\"get_workflow_run_usage\", \"get_workflow_run_logs_url\", \"watch_workflow_run\"}, get.Properties[\"method\"].Enum)')
+          path.write_text(text)
+          PY
+          gofmt -w pkg/github/actions.go pkg/github/actions_types.go pkg/github/actions_watch.go pkg/github/actions_watch_test.go pkg/github/typed_actions_outputs_test.go
+      - name: Generate expected schema snapshot and documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPDATE_TOOLSNAPS=true go test ./pkg/github -run '^Test_ActionsGet$' -count=1
+          bash script/generate-docs
+      - name: Validate dependencies, race tests, build, and whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            go mod tidy -diff &&
+            bash script/test &&
+            go build -o "$RUNNER_TEMP/github-mcp-server" ./cmd/github-mcp-server &&
+            git diff --check
+          } 2>&1 | tee "$RUNNER_TEMP/watch-validation.log"
+      - name: Commit validated source only to the integration branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = e3809fe91c7546633241006bf0b91f23b2595e28
+          test "$(git ls-remote origin refs/heads/integration/watch-workflow-run-1c7d37a | cut -f1)" = "$GITHUB_SHA"
+          git add -- README.md pkg/github/actions.go pkg/github/actions_types.go pkg/github/actions_watch.go pkg/github/actions_watch_test.go pkg/github/typed_actions_outputs_test.go pkg/github/__toolsnaps__/actions_get.snap
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Port upstream #3406 onto typed Actions tools' -m 'Upstream-Commit: 1c7d37aac4bc9697bdbe853a844e6c502d07c30c' -m 'Co-authored-by: Mehdi <mehdimamasxd@gmail.com>'
+          git push origin HEAD:refs/heads/integration/watch-workflow-run-1c7d37a
+          git show --stat --oneline HEAD >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish validation tail
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/watch-validation.log"; then
+            printf '\n```text\n' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 100 "$RUNNER_TEMP/watch-validation.log" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi

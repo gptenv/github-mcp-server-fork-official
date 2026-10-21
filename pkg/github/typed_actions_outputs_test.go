@@ -507,7 +507,7 @@ func TestActionsAdvertisedInputMetadata(t *testing.T) {
 	get := ActionsGet(tr).Tool.InputSchema.(*jsonschema.Schema)
 	trigger := ActionsRunTrigger(tr).Tool.InputSchema.(*jsonschema.Schema)
 	assert.Equal(t, []any{"list_workflows", "list_workflow_runs", "list_workflow_jobs", "list_workflow_run_artifacts"}, list.Properties["method"].Enum)
-	assert.Equal(t, []any{"get_workflow", "get_workflow_run", "get_workflow_job", "download_workflow_run_artifact", "get_workflow_run_usage", "get_workflow_run_logs_url"}, get.Properties["method"].Enum)
+	assert.Equal(t, []any{"get_workflow", "get_workflow_run", "get_workflow_job", "download_workflow_run_artifact", "get_workflow_run_usage", "get_workflow_run_logs_url", "watch_workflow_run"}, get.Properties["method"].Enum)
 	assert.Equal(t, []any{"run_workflow", "rerun_workflow_run", "rerun_failed_jobs", "cancel_workflow_run", "delete_workflow_run_logs"}, trigger.Properties["method"].Enum)
 	runs := list.Properties["workflow_runs_filter"]
 	assert.Equal(t, "object", runs.Type)
